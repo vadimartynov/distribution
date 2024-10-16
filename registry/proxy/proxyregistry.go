@@ -16,6 +16,7 @@ import (
 	"github.com/docker/distribution/registry/client/auth"
 	"github.com/docker/distribution/registry/client/auth/challenge"
 	"github.com/docker/distribution/registry/client/transport"
+	"github.com/docker/distribution/registry/operations"
 	"github.com/docker/distribution/registry/proxy/scheduler"
 	"github.com/docker/distribution/registry/storage"
 	"github.com/docker/distribution/registry/storage/driver"
@@ -25,6 +26,7 @@ import (
 type proxyingRegistry struct {
 	embedded       distribution.Namespace // provides local registry functionality
 	scheduler      *scheduler.TTLExpirationScheduler
+	operations     *operations.TTLExpirationSetter
 	remoteURL      url.URL
 	authChallenger authChallenger
 	remotePathOnly string
@@ -106,6 +108,17 @@ func NewRegistryPullThroughCache(ctx context.Context, registry distribution.Name
 		return nil, err
 	}
 
+	opStateInstance, err := operations.GetOperationsStateInstance(ctx, driver, "Proxy")
+	if err != nil {
+		return nil, err
+	}
+
+	o := operations.NewTTLExpirationSetter(ctx, registry, s, opStateInstance)
+	err = o.Start()
+	if err != nil {
+		return nil, err
+	}
+
 	cs, err := configureAuth(config.Username, config.Password, config.RemoteURL)
 	if err != nil {
 		return nil, err
@@ -113,6 +126,7 @@ func NewRegistryPullThroughCache(ctx context.Context, registry distribution.Name
 
 	return &proxyingRegistry{
 		embedded:       registry,
+		operations:     o,
 		scheduler:      s,
 		remoteURL:      *remoteURL,
 		remotePathOnly: remotePathOnly,

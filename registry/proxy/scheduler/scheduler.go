@@ -223,6 +223,12 @@ func (ttles *TTLExpirationScheduler) Stop() {
 	ttles.stopped = true
 }
 
+func (ttles *TTLExpirationScheduler) SaveState() error {
+	ttles.Lock()
+	defer ttles.Unlock()
+	return ttles.writeState()
+}
+
 func (ttles *TTLExpirationScheduler) writeState() error {
 	jsonBytes, err := json.Marshal(ttles.entries)
 	if err != nil {
