@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/distribution/reference"
+	"github.com/docker/distribution"
 	dcontext "github.com/docker/distribution/context"
 	"github.com/docker/distribution/registry/storage/driver"
+	"github.com/opencontainers/go-digest"
 )
 
 // onTTLExpiryFunc is called when a repository's TTL expires
@@ -20,6 +22,8 @@ const (
 	entryTypeManifest
 	indexSaveFrequency = 5 * time.Second
 )
+
+var repositoryTTL = 24 * 7 * time.Hour // TTL for repository objects (1 week)
 
 // schedulerEntry represents an entry in the scheduler
 // fields are exported for serialization
@@ -32,9 +36,10 @@ type schedulerEntry struct {
 }
 
 // New returns a new instance of the scheduler
-func New(ctx context.Context, driver driver.StorageDriver, path string) *TTLExpirationScheduler {
+func New(ctx context.Context, driver driver.StorageDriver, registry distribution.Namespace, path string) *TTLExpirationScheduler {
 	return &TTLExpirationScheduler{
 		entries:         make(map[string]*schedulerEntry),
+		registry:        registry,
 		driver:          driver,
 		pathToStateFile: path,
 		ctx:             ctx,
@@ -51,6 +56,7 @@ type TTLExpirationScheduler struct {
 
 	entries map[string]*schedulerEntry
 
+	registry        distribution.Namespace
 	driver          driver.StorageDriver
 	ctx             context.Context
 	pathToStateFile string
@@ -241,7 +247,7 @@ func (ttles *TTLExpirationScheduler) readState() error {
 	if _, err := ttles.driver.Stat(ttles.ctx, ttles.pathToStateFile); err != nil {
 		switch err := err.(type) {
 		case driver.PathNotFoundError:
-			return nil
+			return ttles.createStateFromStorage()
 		default:
 			return err
 		}
@@ -257,4 +263,123 @@ func (ttles *TTLExpirationScheduler) readState() error {
 		return err
 	}
 	return nil
+}
+
+// createStateFromStorage sets expiration (TTL) for manifests and blobs in the repository
+func (ttles *TTLExpirationScheduler) createStateFromStorage() error {
+	// Convert registry to a RepositoryEnumerator to iterate through repositories
+	repositoryEnumerator, ok := ttles.registry.(distribution.RepositoryEnumerator)
+	if !ok {
+		return fmt.Errorf("unable to convert Namespace to RepositoryEnumerator")
+	}
+
+	// Sets to track manifests and blobs that will have TTLs assigned
+	manifestRefSet := make(map[reference.Canonical]struct{})
+	blobRefMap := make(map[digest.Digest]reference.Canonical)
+
+	// Iterate through all repositories
+	err := repositoryEnumerator.Enumerate(ttles.ctx, func(repoName string) error {
+		named, err := reference.WithName(repoName)
+		if err != nil {
+			return fmt.Errorf("failed to parse repo name %s: %v", repoName, err)
+		}
+
+		// Retrieve the repository
+		repository, err := ttles.registry.Repository(ttles.ctx, named)
+		if err != nil {
+			return fmt.Errorf("failed to construct repository: %v", err)
+		}
+
+		// Retrieve the manifest service for the repository
+		manifestService, err := repository.Manifests(ttles.ctx)
+		if err != nil {
+			return fmt.Errorf("failed to construct manifest service: %v", err)
+		}
+
+		// Convert the manifest service to a ManifestEnumerator
+		manifestEnumerator, ok := manifestService.(distribution.ManifestEnumerator)
+		if !ok {
+			return fmt.Errorf("unable to convert ManifestService into ManifestEnumerator")
+		}
+
+		// Enumerate through all manifests in the repository
+		err = manifestEnumerator.Enumerate(ttles.ctx, func(dgst digest.Digest) error {
+			// Add the manifest reference to the tracking set
+			manifestRef, err := reference.WithDigest(named, dgst)
+			if err != nil {
+				return fmt.Errorf("failed to create manifest reference: %v", err)
+			}
+			manifestRefSet[manifestRef] = struct{}{}
+
+			// Retrieve the manifest data
+			manifest, err := manifestService.Get(ttles.ctx, dgst)
+			if err != nil {
+				return fmt.Errorf("failed to retrieve manifest for digest %v: %v", dgst, err)
+			}
+
+			// Add all blobs from the manifest's references to the blob tracking set
+			descriptors := manifest.References()
+			for _, descriptor := range descriptors {
+				blobDigest := descriptor.Digest
+				blobRef, err := reference.WithDigest(named, descriptor.Digest)
+				if err != nil {
+					return fmt.Errorf("failed to create blob reference: %v", err)
+				}
+				blobRefMap[blobDigest] = blobRef
+			}
+			return nil
+		})
+
+		// Handle non-existent paths (e.g., unfinished uploads or deleted content)
+		if err != nil {
+			if _, ok := err.(driver.PathNotFoundError); !ok {
+				return err
+			}
+		}
+		return nil
+	})
+
+	if err != nil {
+		if _, ok := err.(driver.PathNotFoundError); !ok {
+			return fmt.Errorf("failed to mark manifests: %v", err)
+		}
+	}
+
+	blobRefSet := make(map[reference.Canonical]struct{})
+	blobEnumerator := ttles.registry.Blobs()
+	err = blobEnumerator.Enumerate(ttles.ctx, func(dgst digest.Digest) error {
+		blobRef, ok := blobRefMap[dgst]
+		if ok {
+			blobRefSet[blobRef] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		if _, ok := err.(driver.PathNotFoundError); !ok {
+			return fmt.Errorf("failed to mark blobs: %v", err)
+		}
+	}
+
+	// Schedule TTL for all manifests
+	for manifestRef := range manifestRefSet {
+		entry := &schedulerEntry{
+			Key:       manifestRef.String(),
+			Expiry:    time.Now().Add(repositoryTTL),
+			EntryType: entryTypeManifest,
+		}
+		ttles.entries[entry.Key] = entry
+	}
+
+	// Schedule TTL for all blobs
+	for blobRef := range blobRefSet {
+		entry := &schedulerEntry{
+			Key:       blobRef.String(),
+			Expiry:    time.Now().Add(repositoryTTL),
+			EntryType: entryTypeBlob,
+		}
+		ttles.entries[entry.Key] = entry
+	}
+
+	// Persist the scheduler state to ensure data is saved
+	return ttles.writeState()
 }
