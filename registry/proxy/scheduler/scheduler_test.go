@@ -443,6 +443,9 @@ func TestStateFromStorageRestoreOld(t *testing.T) {
 		t.Fatalf(err.Error())
 	}
 
+	// load new image
+	_, _ = populateRepo(ctx, t, registry, "f/g/h", "latest", 2)
+
 	s2 := New(context.Background(), driver, registry, pathToStatFile)
 	err = s2.Start()
 	if err != nil {
