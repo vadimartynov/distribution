@@ -339,15 +339,20 @@ func TestStateFromStorage(t *testing.T) {
 
 	ctx := context.Background()
 	driver, registry := newRegistry(t)
-	manifest1, blobs1 := populateRepo(ctx, t, registry, "a/b/c", "latest", 3)
-	manifest2, blobs2 := populateRepo(ctx, t, registry, "c/d/e", "latest", 6)
+	manifest1, blobs1 := populateRepo(ctx, t, registry, "test", "latest", 1)
+	manifest2, blobs2 := populateRepo(ctx, t, registry, "a/b/c", "latest", 3)
+	manifest3, blobs3 := populateRepo(ctx, t, registry, "c/d/e", "latest", 6)
 
 	allManifests[manifest1] = struct{}{}
 	allManifests[manifest2] = struct{}{}
+	allManifests[manifest3] = struct{}{}
 	for _, blob := range blobs1 {
 		allBlobs[blob] = struct{}{}
 	}
 	for _, blob := range blobs2 {
+		allBlobs[blob] = struct{}{}
+	}
+	for _, blob := range blobs3 {
 		allBlobs[blob] = struct{}{}
 	}
 
@@ -420,6 +425,7 @@ func TestStateFromStorageRestoreOld(t *testing.T) {
 
 	ctx := context.Background()
 	driver, registry := newRegistry(t)
+	_, _ = populateRepo(ctx, t, registry, "test", "latest", 1)
 	_, _ = populateRepo(ctx, t, registry, "a/b/c", "latest", 3)
 	_, _ = populateRepo(ctx, t, registry, "c/d/e", "latest", 6)
 
